@@ -9,10 +9,12 @@ import (
 	"net"
 	"net/http"
 	gopath "path"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gabriel-vasile/mimetype"
+	"github.com/gorilla/websocket"
 	files "github.com/ipfs/go-ipfs-files"
 	ipath "github.com/ipfs/go-path"
 	"github.com/myelnet/pop/exchange"
@@ -100,8 +102,25 @@ func (s *server) writeToClients(b []byte) {
 	}
 }
 
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
 func (s *server) localhostHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := strings.ToLower(r.Header.Get("Connection"))
+		if strings.Contains(h, "upgrade") {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			ws, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				log.Error().Err(err).Msg("websocket upgrade")
+				return
+			}
+			s.wsHandler(r.Context(), ws)
+			return
+		}
 		if r.URL.Path == "/" {
 			io.WriteString(w, "<html><title>pop</title><body><h1>Hello</h1>This is your Myel pop.")
 			return
@@ -192,6 +211,31 @@ func (s *server) getHandler(w http.ResponseWriter, r *http.Request) {
 		http.ServeContent(w, r, name, modtime, content)
 	}
 
+}
+
+func (s *server) wsHandler(ctx context.Context, ws *websocket.Conn) {
+	defer ws.Close()
+	ws.SetReadLimit(MaxMessageSize)
+	ws.SetReadDeadline(time.Now().Add(60 * time.Second))
+
+	for {
+		_, msg, err := ws.ReadMessage()
+		if err != nil {
+			log.Error().Err(err).Msg("ws.ReadMessage")
+			return
+		}
+		s.csMu.Lock()
+		s.cs.sendNotifyMsg = func(b []byte) {
+			if err := ws.WriteMessage(websocket.TextMessage, b); err != nil {
+				log.Error().Err(err)
+				ws.Close()
+			}
+		}
+		if err := s.cs.GotMsgBytes(ctx, msg); err != nil {
+			log.Error().Err(err).Msg("GotMsgBytes")
+		}
+		s.csMu.Unlock()
+	}
 }
 
 // Run runs a pop IPFS node
